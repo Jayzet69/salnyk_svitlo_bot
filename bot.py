@@ -1,5 +1,5 @@
 """Бот: сповіщає в Telegram, коли за графіком VOE вимикають/вмикають світло."""
-import os, re, json, hashlib, datetime as dt
+import os, re, json, time, hashlib, datetime as dt
 from zoneinfo import ZoneInfo
 from curl_cffi import requests
 
@@ -87,51 +87,96 @@ def fmt(t, now):
     return t.strftime("%H:%M") + day
 
 
+def dur(a, b):
+    m = round((b - a).total_seconds() / 60)
+    h, m = divmod(m, 60)
+    return " ".join(x for x in [f"{h} год" if h else "", f"{m} хв" if m else ""] if x) or "0 хв"
+
+
+def period(a, b, now):
+    return f"{fmt(a, now)} – {fmt(b, now)} ({dur(a, b)})"
+
+
 def schedule_text(iv, now, table):
     lines = [f"📅 Графік змінився (черга {table.get('listnum', '?')}):"]
     future = [x for x in iv if x[1] > now]
-    lines += [f"• {fmt(a, now)} – {fmt(b, now)} ({k})" for a, b, k in future] or ["• відключень не заплановано ✅"]
+    lines += [f"• {period(max(a, now) if a < now else a, b, now)} — {k}" for a, b, k in future] or ["• відключень не заплановано ✅"]
     return "\n".join(lines)
+
+
+def check(st, cid, iv, now):
+    """Перевіряє статус і нагадування. Кожне нагадування надсилається лише один раз."""
+    sent = st.setdefault("sent", [])
+
+    def once(key, text):
+        if key not in sent:
+            tg("sendMessage", chat_id=cid, text=text)
+            sent.append(key)
+            del sent[:-100]
+
+    cur = next((x for x in iv if x[0] <= now < x[1]), None)
+    nxt = next((x for x in iv if x[0] > now), None)
+    status = "off" if cur else "on"
+
+    if status != st.get("status"):
+        if status == "off":
+            tg("sendMessage", chat_id=cid, text=f"🔴 Світло вимкнули ({cur[2]})\nБез світла: {period(cur[0], cur[1], now)}")
+        else:
+            prev = max((x[1] for x in iv if x[1] <= now), default=None)
+            a = prev if prev and now - prev < dt.timedelta(minutes=30) else now
+            text = f"🟢 Світло увімкнули\nЗі світлом: {period(a, nxt[0], now)}" if nxt else \
+                "🟢 Світло увімкнули\nНаступних відключень поки не заплановано"
+            tg("sendMessage", chat_id=cid, text=text)
+        st["status"] = status
+
+    if nxt:  # нагадування перед вимкненням
+        left = (nxt[0] - now).total_seconds() / 60
+        k = nxt[0].isoformat()
+        if 6 < left <= 30:
+            once("w30:" + k, f"⏰ Через {round(left)} хв вимкнення світла\nБез світла: {period(nxt[0], nxt[1], now)}")
+        elif 0 < left <= 6:
+            once("w5:" + k, f"⚠️ Через {max(1, round(left))} хв вимкнення світла!\nБез світла: {period(nxt[0], nxt[1], now)}")
+    if cur:  # нагадування перед увімкненням
+        left = (cur[1] - now).total_seconds() / 60
+        if 0 < left <= 10:
+            once("on10:" + cur[1].isoformat(), f"💡 Через {max(1, round(left))} хв має з'явитися світло (о {fmt(cur[1], now)})")
 
 
 def main():
     st = load_state()
     cid = chat_id(st)
-    now = dt.datetime.now(TZ)
-    try:
-        table = fetch()
-    except Exception as e:
-        st["fails"] = st.get("fails", 0) + 1
-        print("Помилка:", e)
-        if st["fails"] == 6:  # ~30 хв підряд не вдається
-            tg("sendMessage", chat_id=cid, text=f"⚠️ Не можу отримати графік з сайту VOE.\n{str(e)[:300]}")
+    run_until = time.time() + 60 * float(os.environ.get("RUN_MINUTES", "0"))
+    iv, table, last_fetch = None, None, 0
+    first = True
+    while first or time.time() < run_until:
+        first = False
+        now = dt.datetime.now(TZ)
+        if time.time() - last_fetch >= 180 or iv is None:  # сайт опитуємо раз на 3 хв
+            last_fetch = time.time()
+            try:
+                table = fetch()
+                if st.get("fails", 0) >= 6:
+                    tg("sendMessage", chat_id=cid, text="✅ Сайт VOE знову доступний")
+                st["fails"] = 0
+                iv = parse(table)
+                h = hashlib.sha1(json.dumps([[str(a), str(b), k] for a, b, k in iv if b > now]).encode()).hexdigest()
+                if "status" not in st:
+                    tg("sendMessage", chat_id=cid, text="🤖 Бот запущено. Стежу за адресою: "
+                       f"{ADDR.get('city_label', '')}, {ADDR.get('street_label', '')}, {ADDR.get('house_label', '')}")
+                if h != st.get("sched"):
+                    tg("sendMessage", chat_id=cid, text=schedule_text(iv, now, table))
+                    st["sched"] = h
+            except Exception as e:
+                st["fails"] = st.get("fails", 0) + 1
+                print("Помилка:", e)
+                if st["fails"] == 6:
+                    tg("sendMessage", chat_id=cid, text=f"⚠️ Не можу отримати графік з сайту VOE.\n{str(e)[:300]}")
+        if iv is not None:
+            check(st, cid, iv, now)
         save_state(st)
-        return
-    if st.get("fails", 0) >= 6:
-        tg("sendMessage", chat_id=cid, text="✅ Сайт VOE знову доступний")
-    st["fails"] = 0
-
-    iv = parse(table)
-    cur = next((x for x in iv if x[0] <= now < x[1]), None)
-    status = "off" if cur else "on"
-    sched_hash = hashlib.sha1(json.dumps([[str(a), str(b), k] for a, b, k in iv if b > now]).encode()).hexdigest()
-
-    if "status" not in st:
-        tg("sendMessage", chat_id=cid, text="🤖 Бот запущено. Стежу за адресою: "
-           f"{ADDR.get('city_label', '')}, {ADDR.get('street_label', '')}, {ADDR.get('house_label', '')}")
-    if status != st.get("status"):
-        if status == "off":
-            text = f"🔴 Світло вимкнули ({cur[2]})\nОрієнтовно до {fmt(cur[1], now)}"
-        else:
-            nxt = next((x for x in iv if x[0] > now), None)
-            text = "🟢 Світло увімкнули" + (f"\nНаступне вимкнення: {fmt(nxt[0], now)} – {fmt(nxt[1], now)}" if nxt else "")
-        tg("sendMessage", chat_id=cid, text=text)
-    if sched_hash != st.get("sched"):
-        tg("sendMessage", chat_id=cid, text=schedule_text(iv, now, table))
-
-    st.update(status=status, sched=sched_hash)
-    save_state(st)
-    print("OK", status)
+        if time.time() < run_until:
+            time.sleep(20)
+    print("OK", st.get("status"))
 
 
 if __name__ == "__main__":
